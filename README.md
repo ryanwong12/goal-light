@@ -146,3 +146,18 @@ Avoid using:
 ```
 
 unless you intentionally want system-wide installs.s
+
+## Getting Sample Video
+
+**yt-dlp** is your best friend here:
+
+```bash
+pip install yt-dlp
+yt-dlp -f "best[height<=720]" "<youtube_url>" -o sample.mp4
+```
+
+You can use
+
+```bash
+yt-dlp --list-formats "<youtube_url>
+```

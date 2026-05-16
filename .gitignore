@@ -1,1 +1,5 @@
 .venv
+
+dev
+samples
+__pycache__
