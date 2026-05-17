@@ -44,7 +44,7 @@ class Config:
     red_threshold: float = 0.35
 
     # Substrings that match the wordmark (catches partial/animated frames).
-    canadiens_strings: tuple = ("ANADIE", "CANADIEN")
+    canadiens_strings: tuple = ("ANADIE", "CANADIEN", "NADI", "CANADIENS")
 
     # Seconds after seeing CANADIENS to still accept a GOAL frame.
     canadiens_window_seconds: float = 5.0
@@ -361,7 +361,7 @@ if __name__ == "__main__":
     config = Config(
         video_source=args.source,
         roi=(68, 22, 146, 29),
-        logo_template_path="dev/template/habs_logo_template.png",
+        # logo_template_path="dev/template/habs_logo_template.png",
         sample_fps=args.fps,
     )
     run(config)
