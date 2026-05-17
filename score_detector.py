@@ -5,7 +5,9 @@ import time
 import os
 import logging
 import math
-from dataclasses import dataclass
+import argparse
+from datetime import datetime
+from dataclasses import dataclass, field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -20,160 +22,308 @@ class Config:
     # File path for development, integer device index for capture card (e.g. 0)
     video_source: str | int = "sample.mp4"
 
+    # --- Logo detection (stage 1) ---
+    logo_template_path: str | None = None
+
     # ROI excluding the SN watermark (x, y, w, h)
     roi: tuple = (68, 22, 146, 29)
 
-    # Stage 1: minimum fraction of red pixels to bother running OCR
+    # Logo template matching threshold
+    logo_match_threshold: float = 0.72
+    logo_scale_range: tuple = (0.8, 1.3)
+    logo_scale_steps: int = 10
+    logo_window_seconds: float = 8.0
+
+    # --- CANADIENS detection (stage 2) ---
     red_threshold: float = 0.35
-
-    # Stage 2a: substrings that match the CANADIENS wordmark
-    # "ANADIE" is the stable core even when edges are cropped by the animation
-    canadiens_strings: tuple = ("ANADIE", "CANADIEN", "CANADIENS")
-
-    # Stage 2b: substrings that match the GOAL banner (must follow 2a)
-    goal_strings: tuple = ("GOAL",)
-
-    # Frames per second to sample (2 is plenty, keeps CPU low)
-    sample_fps: int = 10
-
-    # Seconds after seeing CANADIENS to still accept a GOAL frame.
-    # The animation runs ~2-3s so 5s gives comfortable headroom.
+    canadiens_strings: tuple = ("ANADIE", "CANADIEN", "NADI", "CANADIENS")
     canadiens_window_seconds: float = 5.0
 
-    # Seconds to ignore further triggers after a goal fires
-    goal_cooldown_seconds: int = 60
+    # --- GOAL detection (stage 3) ---
+    goal_strings: tuple = ("GOAL",)
 
-    start_time_str: str = time.strftime('%Y%m%d_%H%M%S')
+    # --- General ---
+    sample_fps: int = 5
+    goal_cooldown_seconds: int = 30
+
+    # Live mode: if True, cooldown uses wall-clock time (for real HDMI capture).
+    # If False (file mode), cooldown uses video time derived from frame number.
+    live: bool = False
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — cheap red detection
+# State
 # ---------------------------------------------------------------------------
 
-def is_mostly_red(roi_frame: np.ndarray, threshold: float) -> bool:
-    """
-    Returns True if enough of the ROI is red.
-    Red wraps around in HSV so we need two ranges.
-    This is just a gate — not the trigger.
-    """
-    hsv = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
+IDLE           = "idle"
+LOGO_SEEN      = "logo_seen"
+CANADIENS_SEEN = "canadiens_seen"
+
+
+@dataclass
+class DetectorState:
+    state: str = IDLE
+    state_entered_at: float = field(default_factory=time.time)
+    # Wall-clock time of last goal (used in live mode)
+    last_goal_wall_time: float = 0.0
+    # Video time of last goal in seconds (used in file mode)
+    last_goal_video_time: float = 0.0
+    goals_detected: int = 0
+    ocr_calls: int = 0
+    logo_calls: int = 0
+
+
+@dataclass
+class FrameResult:
+    """Everything process_frame() observed and decided for one frame."""
+    red_ratio: float = 0.0
+    is_red: bool = False
+    ocr_text: str = ""
+    logo_score: float = 0.0
+    canadiens_matched: bool = False
+    goal_matched: bool = False
+    logo_matched: bool = False
+    prev_state: str = IDLE
+    new_state: str = IDLE
+    goal_fired: bool = False
+    cooldown_blocked: bool = False
+    window_expired: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Detection primitives
+# ---------------------------------------------------------------------------
+
+def load_template(path: str) -> np.ndarray | None:
+    tmpl = cv2.imread(path)
+    if tmpl is None:
+        log.warning(
+            f"Logo template not found at {path!r}. "
+            "Logo detection (stage 1) will be skipped."
+        )
+    else:
+        log.info(f"Loaded logo template from {path!r} — shape {tmpl.shape}")
+    return tmpl
+
+
+def logo_detected(
+    roi_frame: np.ndarray,
+    template: np.ndarray,
+    threshold: float,
+    scale_range: tuple,
+    scale_steps: int,
+) -> tuple[bool, float]:
+    """Returns (matched, best_score)."""
+    gray_roi  = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2GRAY)
+    gray_tmpl = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if len(template.shape) == 3 else template
+    th, tw = gray_tmpl.shape
+
+    best_score = 0.0
+    for scale in np.linspace(scale_range[0], scale_range[1], scale_steps):
+        sw, sh = int(tw * scale), int(th * scale)
+        if sh > gray_roi.shape[0] or sw > gray_roi.shape[1] or sh < 4 or sw < 4:
+            continue
+        scaled = cv2.resize(gray_tmpl, (sw, sh))
+        result = cv2.matchTemplate(gray_roi, scaled, cv2.TM_CCOEFF_NORMED)
+        score  = float(result.max())
+        if score > best_score:
+            best_score = score
+        if score > threshold:
+            log.debug(f"Logo matched at scale {scale:.2f}, score {score:.3f}")
+            return True, best_score
+
+    log.debug(f"Logo best score: {best_score:.3f} (threshold {threshold})")
+    return False, best_score
+
+
+def red_ratio(roi_frame: np.ndarray) -> float:
+    hsv   = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
     mask1 = cv2.inRange(hsv, (0,   120, 70), (10,  255, 255))
     mask2 = cv2.inRange(hsv, (170, 120, 70), (180, 255, 255))
-    red_pixels = cv2.countNonZero(mask1 | mask2)
-    total_pixels = roi_frame.shape[0] * roi_frame.shape[1]
-    ratio = red_pixels / total_pixels
-    return ratio > threshold
+    red   = cv2.countNonZero(mask1 | mask2)
+    total = roi_frame.shape[0] * roi_frame.shape[1]
+    return red / total
 
-
-# ---------------------------------------------------------------------------
-# Stage 2 — OCR confirmation
-# ---------------------------------------------------------------------------
 
 def preprocess_for_ocr(roi_frame: np.ndarray) -> np.ndarray:
-    """
-    Scale up and threshold for better Tesseract accuracy.
-    White bold text on red background — invert so text is dark on light.
-    """
-    scaled = cv2.resize(roi_frame, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
-    # Invert: white text on red becomes dark text on light background
-    inverted = cv2.bitwise_not(gray)
+    scaled    = cv2.resize(roi_frame, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    gray      = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    inverted  = cv2.bitwise_not(gray)
     _, binary = cv2.threshold(inverted, 100, 255, cv2.THRESH_BINARY)
     return binary
 
 
-def ocr_matches(roi_frame: np.ndarray, substrings: tuple) -> bool:
-    """
-    Run Tesseract and check whether any of the given substrings appear.
-    """
+def run_ocr(roi_frame: np.ndarray) -> tuple[str, np.ndarray]:
+    """Returns (uppercase text, preprocessed image)."""
     processed = preprocess_for_ocr(roi_frame)
     text = pytesseract.image_to_string(processed, config="--psm 7").upper().strip()
     if text:
         log.debug(f"OCR read: {text!r}")
+    return text, processed
+
+
+def ocr_matches(text: str, substrings: tuple) -> bool:
     return any(s in text for s in substrings)
 
 
-# ---------------------------------------------------------------------------
-# Main detection loop
-# ---------------------------------------------------------------------------
-
-def fire_goal(cap, frame, frame_num, source_fps, goals_detected, goal_callback, start_time_str=Config.start_time_str):
+def in_cooldown(
+    state: "DetectorState",
+    config: Config,
+    video_time: float,
+) -> bool:
     """
-    Compute timestamp, save frame, and invoke callback.
-    Extracted so it can be called from one place regardless of which
-    path through the state machine confirmed the goal.
+    Check cooldown using video time (file mode) or wall-clock (live mode).
+    video_time is the current frame position in seconds.
     """
-    try:
-        timestamp_seconds = frame_num / (source_fps or 1)
-    except Exception:
-        timestamp_seconds = 0.0
+    if config.live:
+        return (time.time() - state.last_goal_wall_time) < config.goal_cooldown_seconds
+    else:
+        return (video_time - state.last_goal_video_time) < config.goal_cooldown_seconds
 
-    timestamp_str = time.strftime("%H:%M:%S", time.gmtime(timestamp_seconds))
 
-    try:
-        save_dir = f"dev/detected/{start_time_str}"
-        os.makedirs(save_dir, exist_ok=True)
-        safe_ts = timestamp_str.replace(":", "-")
-        filename = f"goal_{goals_detected:03d}_frame{frame_num}_{safe_ts}.jpg"
-        save_path = os.path.join(save_dir, filename)
-        cv2.imwrite(save_path, frame)
-        log.info(f"Saved detected frame to {save_path}")
-    except Exception as e:
-        log.warning(f"Failed to save detected frame: {e}")
+def update_cooldown(state: "DetectorState", video_time: float) -> None:
+    """Record the time of a confirmed goal."""
+    state.last_goal_wall_time  = time.time()
+    state.last_goal_video_time = video_time
 
-    try:
-        goal_callback(timestamp_seconds, timestamp_str)
-    except TypeError:
-        try:
-            goal_callback(timestamp_seconds)
-        except TypeError:
-            goal_callback()
 
+# ---------------------------------------------------------------------------
+# process_frame — single source of truth for detection logic
+# ---------------------------------------------------------------------------
+
+def process_frame(
+    roi_frame: np.ndarray,
+    state: DetectorState,
+    config: Config,
+    template: np.ndarray | None,
+    video_time: float = 0.0,
+) -> FrameResult:
+    """
+    Run one frame through the full detection pipeline.
+    Mutates `state` in place. Returns a FrameResult describing everything
+    that happened — used by both run() and the debugger.
+
+    video_time: current frame position in seconds (frame_num / source_fps).
+                Used for cooldown in file mode; ignored in live mode.
+    """
+    result   = FrameResult(prev_state=state.state, new_state=state.state)
+    now      = time.time()
+    elapsed  = now - state.state_entered_at
+    has_tmpl = template is not None
+
+    # ── measure red ──────────────────────────────────────────────────────────
+    result.red_ratio = red_ratio(roi_frame)
+    result.is_red    = result.red_ratio > config.red_threshold
+
+    # ── IDLE ─────────────────────────────────────────────────────────────────
+    if state.state == IDLE:
+        if has_tmpl:
+            state.logo_calls += 1
+            matched, score = logo_detected(
+                roi_frame, template,
+                config.logo_match_threshold,
+                config.logo_scale_range,
+                config.logo_scale_steps,
+            )
+            result.logo_score   = score
+            result.logo_matched = matched
+            if matched:
+                state.state = LOGO_SEEN
+                state.state_entered_at = now
+        else:
+            if result.is_red:
+                state.state = LOGO_SEEN
+                state.state_entered_at = now
+
+        result.new_state = state.state
+        return result
+
+    # ── LOGO_SEEN ─────────────────────────────────────────────────────────────
+    if state.state == LOGO_SEEN:
+        if elapsed > config.logo_window_seconds:
+            result.window_expired = True
+            state.state = IDLE
+            state.state_entered_at = now
+            result.new_state = state.state
+            return result
+
+        if not result.is_red:
+            result.new_state = state.state
+            return result
+
+        state.ocr_calls += 1
+        result.ocr_text, _ = run_ocr(roi_frame)
+        result.canadiens_matched = ocr_matches(result.ocr_text, config.canadiens_strings)
+
+        if result.canadiens_matched:
+            state.state = CANADIENS_SEEN
+            state.state_entered_at = now
+
+        result.new_state = state.state
+        return result
+
+    # ── CANADIENS_SEEN ───────────────────────────────────────────────────────
+    if state.state == CANADIENS_SEEN:
+        if elapsed > config.canadiens_window_seconds:
+            result.window_expired = True
+            state.state = IDLE
+            state.state_entered_at = now
+            result.new_state = state.state
+            return result
+
+        if not result.is_red:
+            result.new_state = state.state
+            return result
+
+        state.ocr_calls += 1
+        result.ocr_text, _ = run_ocr(roi_frame)
+        result.goal_matched = ocr_matches(result.ocr_text, config.goal_strings)
+
+        if result.goal_matched:
+            state.state = IDLE
+            state.state_entered_at = now
+            if in_cooldown(state, config, video_time):
+                result.cooldown_blocked = True
+            else:
+                result.goal_fired = True
+                state.goals_detected += 1
+                update_cooldown(state, video_time)
+
+        result.new_state = state.state
+        return result
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# run() — video loop
+# ---------------------------------------------------------------------------
 
 def run(config: Config, goal_callback=None):
     """
-    Main loop. Calls goal_callback() when an MTL goal graphic is detected.
-
-    Detection requires a two-step sequence within a time window:
-      1. ROI turns red AND OCR sees the CANADIENS wordmark.
-      2. ROI is still red AND OCR sees the GOAL banner.
-    Both steps must occur within `canadiens_window_seconds` of each other.
-
-    Special case: if CANADIENS and GOAL are both readable in the same frame
-    (common mid-animation), step 2 is satisfied immediately.
+    Main loop. Calls goal_callback(timestamp_seconds, timestamp_str) on goals.
     """
     if goal_callback is None:
-        goal_callback = lambda ts, ts_str: print(f"GOAL! 🚨 time: {ts_str}")
+        goal_callback = lambda ts, ts_str: log.info(f"GOAL! 🚨  video time: {ts_str}")
+
+    template     = load_template(config.logo_template_path)
+    has_template = template is not None
 
     cap = cv2.VideoCapture(config.video_source)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {config.video_source!r}")
 
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-    if not cap.get(cv2.CAP_PROP_FPS):
-        log.warning("Could not determine source FPS, defaulting to 30")
-    else:
-        log.info(
-            f"Source video {config.video_source!r} has {total_frames} frames "
-            f"at {cap.get(cv2.CAP_PROP_FPS):.2f} FPS"
-        )
-
-    source_fps = math.ceil(cap.get(cv2.CAP_PROP_FPS) or 30)
+    source_fps     = math.ceil(cap.get(cv2.CAP_PROP_FPS) or 30)
     frame_interval = max(1, int(source_fps / config.sample_fps))
-    log.info(f"Source FPS: {source_fps} — sampling every {frame_interval} frames (~{config.sample_fps}fps)")
+    mode_str       = "LIVE (wall-clock cooldown)" if config.live else "FILE (video-time cooldown)"
+    log.info(f"Source FPS: {source_fps} — sampling every {frame_interval} frames (~{config.sample_fps}fps) — mode: {mode_str}")
+    if not has_template:
+        log.info("No logo template — running CANADIENS → GOAL sequence only.")
 
     x, y, w, h = config.roi
-    frame_num = 0
-    goals_detected = 0
-    last_goal_time = 0.0
-    ocr_calls = 0
-
-    # State machine:
-    #   None             → watching for CANADIENS wordmark
-    #   "canadiens_seen" → saw wordmark, now watching for GOAL banner
-    sequence_state = None
-    canadiens_seen_at = 0.0
+    state       = DetectorState()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    frame_num   = 0
 
     try:
         while True:
@@ -186,91 +336,43 @@ def run(config: Config, goal_callback=None):
             if frame_num % frame_interval != 0:
                 continue
 
-            roi_frame = frame[y:y + h, x:x + w]
-            now = time.time()
+            roi_frame  = frame[y:y + h, x:x + w]
+            video_time = frame_num / source_fps
+            result     = process_frame(roi_frame, state, config, template, video_time)
 
-            # ------------------------------------------------------------------
-            # Stage 1: cheap red gate — skip OCR entirely if not red
-            # ------------------------------------------------------------------
-            if not is_mostly_red(roi_frame, config.red_threshold):
-                # Expire a stale canadiens_seen state when the red clears
-                if sequence_state == "canadiens_seen":
-                    elapsed = now - canadiens_seen_at
-                    if elapsed > config.canadiens_window_seconds:
-                        log.debug("CANADIENS window expired (non-red frame) — resetting.")
-                        sequence_state = None
-                continue
+            if result.goal_fired:
+                sequence      = "logo → CANADIENS → GOAL" if has_template else "CANADIENS → GOAL"
+                timestamp_str = time.strftime("%H:%M:%S", time.gmtime(video_time))
+                log.info(f"*** GOAL #{state.goals_detected} CONFIRMED ({sequence}) — video time {timestamp_str} ***")
 
-            # ------------------------------------------------------------------
-            # Stage 2: OCR — frame is red, check what it says
-            # ------------------------------------------------------------------
-            ocr_calls += 1
+                # Save the frame for review. Filename includes goal count, frame number, and timestamp.
+                try:
+                    save_dir  = os.path.join("dev", "detected", run_timestamp)
+                    os.makedirs(save_dir, exist_ok=True)
+                    safe_ts   = timestamp_str.replace(":", "-")
+                    filename  = f"goal_{state.goals_detected:03d}_frame{frame_num}_{safe_ts}.jpg"
+                    cv2.imwrite(os.path.join(save_dir, filename), frame)
+                    log.info(f"Saved frame → {os.path.join(save_dir, filename)}")
+                except Exception as e:
+                    log.warning(f"Could not save frame: {e}")
 
-            # Run OCR once and check both strings to avoid a double call
-            # on the same frame (handles mid-animation overlap).
-            sees_canadiens = ocr_matches(roi_frame, config.canadiens_strings)
-            sees_goal      = ocr_matches(roi_frame, config.goal_strings)
-
-            # ------------------------------------------------------------------
-            # State: waiting for CANADIENS wordmark
-            # ------------------------------------------------------------------
-            if sequence_state is None:
-                if not sees_canadiens:
-                    # Red but not CANADIENS — ignore (other team's graphic, etc.)
-                    continue
-
-                # CANADIENS confirmed.
-                sequence_state = "canadiens_seen"
-                canadiens_seen_at = now
-                log.debug("CANADIENS wordmark detected — waiting for GOAL banner.")
-
-                # Fall through: check if GOAL is also visible in this same frame.
-                # (The `sees_goal` branch below handles it.)
-
-            # ------------------------------------------------------------------
-            # State: CANADIENS seen, waiting for GOAL banner
-            # ------------------------------------------------------------------
-            if sequence_state == "canadiens_seen":
-                # Check window expiry first
-                if now - canadiens_seen_at > config.canadiens_window_seconds:
-                    log.debug("CANADIENS window expired — resetting.")
-                    sequence_state = None
-                    # Don't continue — re-evaluate this frame from scratch
-                    # in case it's a fresh CANADIENS hit.
-                    if sees_canadiens:
-                        sequence_state = "canadiens_seen"
-                        canadiens_seen_at = now
-                        log.debug("Re-armed CANADIENS on the same frame.")
-                    else:
-                        continue
-
-                if not sees_goal:
-                    continue  # Still waiting for the GOAL banner
-
-                # ---- GOAL CONFIRMED (CANADIENS → GOAL sequence) ----
-
-                # Cooldown check
-                if (now - last_goal_time) < config.goal_cooldown_seconds:
-                    remaining = config.goal_cooldown_seconds - (now - last_goal_time)
-                    log.debug(f"Goal sequence detected but in cooldown ({remaining:.0f}s remaining)")
-                    sequence_state = None
-                    continue
-
-                # Fire!
-                sequence_state = None
-                goals_detected += 1
-                last_goal_time = now
-                log.info(f"*** GOAL #{goals_detected} CONFIRMED (CANADIENS → GOAL sequence) ***")
-                fire_goal(cap, frame, frame_num, source_fps, goals_detected, goal_callback)
+                try:
+                    goal_callback(video_time, timestamp_str)
+                except TypeError:
+                    try:
+                        goal_callback(video_time)
+                    except TypeError:
+                        goal_callback()
 
     except KeyboardInterrupt:
         log.info("Stopped by user.")
     finally:
         cap.release()
         log.info(
-            f"Done. Frames processed: {frame_num} | "
-            f"OCR calls: {ocr_calls} | "
-            f"Goals detected: {goals_detected}"
+            f"Done. Frames: {frame_num} | "
+            f"Logo checks: {state.logo_calls} | "
+            f"OCR calls: {state.ocr_calls} | "
+            f"Goals: {state.goals_detected}"
         )
 
 
@@ -279,9 +381,18 @@ def run(config: Config, goal_callback=None):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Detect MTL goals in hockey broadcasts.")
+    parser.add_argument("-s", "--source", type=str, default="samples/mtl_ott_110326_30fps.mp4")
+    parser.add_argument("-f", "--fps",    type=int, default=15)
+    parser.add_argument("--live", action="store_true",
+                        help="Live mode: use wall-clock cooldown (for HDMI capture). "
+                             "Default is file mode: video-time cooldown.")
+    args = parser.parse_args()
+
     config = Config(
-        video_source="samples/mtl_ott_110326_30fps.mp4",
+        video_source=args.source,
         roi=(68, 22, 146, 29),
-        sample_fps=30,
+        sample_fps=args.fps,
+        live=args.live,
     )
     run(config)
