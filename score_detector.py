@@ -6,6 +6,7 @@ import os
 import logging
 import math
 import argparse
+from datetime import datetime
 from dataclasses import dataclass, field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -21,11 +22,13 @@ class Config:
     # File path for development, integer device index for capture card (e.g. 0)
     video_source: str | int = "sample.mp4"
 
+    # --- Logo detection (stage 1) ---
+    logo_template_path: str | None = None
+
     # ROI excluding the SN watermark (x, y, w, h)
     roi: tuple = (68, 22, 146, 29)
 
-    # --- Logo detection (stage 1) ---
-    logo_template_path: str = "dev/habs_logo_template.png"
+    # Logo template matching threshold
     logo_match_threshold: float = 0.72
     logo_scale_range: tuple = (0.8, 1.3)
     logo_scale_steps: int = 10
@@ -41,7 +44,7 @@ class Config:
 
     # --- General ---
     sample_fps: int = 5
-    goal_cooldown_seconds: int = 60
+    goal_cooldown_seconds: int = 30
 
     # Live mode: if True, cooldown uses wall-clock time (for real HDMI capture).
     # If False (file mode), cooldown uses video time derived from frame number.
@@ -319,6 +322,7 @@ def run(config: Config, goal_callback=None):
 
     x, y, w, h = config.roi
     state       = DetectorState()
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     frame_num   = 0
 
     try:
@@ -341,8 +345,9 @@ def run(config: Config, goal_callback=None):
                 timestamp_str = time.strftime("%H:%M:%S", time.gmtime(video_time))
                 log.info(f"*** GOAL #{state.goals_detected} CONFIRMED ({sequence}) — video time {timestamp_str} ***")
 
+                # Save the frame for review. Filename includes goal count, frame number, and timestamp.
                 try:
-                    save_dir  = "dev/detected"
+                    save_dir  = os.path.join("dev", "detected", run_timestamp)
                     os.makedirs(save_dir, exist_ok=True)
                     safe_ts   = timestamp_str.replace(":", "-")
                     filename  = f"goal_{state.goals_detected:03d}_frame{frame_num}_{safe_ts}.jpg"
