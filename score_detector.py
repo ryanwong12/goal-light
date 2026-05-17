@@ -4,6 +4,8 @@ import numpy as np
 import time
 import os
 import logging
+import math
+import argparse
 from dataclasses import dataclass, field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -194,7 +196,7 @@ def run(config: Config, goal_callback=None):
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video source: {config.video_source!r}")
 
-    source_fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    source_fps = math.ceil(cap.get(cv2.CAP_PROP_FPS) or 30)
     frame_interval = max(1, int(source_fps / config.sample_fps))
     log.info(f"Source FPS: {source_fps:.1f} — sampling every {frame_interval} frames (~{config.sample_fps}fps)")
     if not has_template:
@@ -339,9 +341,27 @@ def run(config: Config, goal_callback=None):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Detect goals in hockey broadcasts."
+    )
+    parser.add_argument(
+        "-s", "--source",
+        type=str,
+        default="samples/mtl_ott_110326_30fps.mp4",
+        help="Video source (file path or device index). Default: %(default)s"
+    )
+    parser.add_argument(
+        "-f", "--fps",
+        type=int,
+        default=15,
+        help="Sample frames per second. Default: %(default)s"
+    )
+    args = parser.parse_args()
+
     config = Config(
-        video_source="samples/mtl_ott_110326_30fps.mp4",
+        video_source=args.source,
         roi=(68, 22, 146, 29),
-        logo_template_path="dev/habs_logo_template.png",
+        logo_template_path="dev/template/habs_logo_template.png",
+        sample_fps=args.fps,
     )
     run(config)
