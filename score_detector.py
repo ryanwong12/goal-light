@@ -43,6 +43,10 @@ class Config:
     sample_fps: int = 5
     goal_cooldown_seconds: int = 60
 
+    # Live mode: if True, cooldown uses wall-clock time (for real HDMI capture).
+    # If False (file mode), cooldown uses video time derived from frame number.
+    live: bool = False
+
 
 # ---------------------------------------------------------------------------
 # State
@@ -57,7 +61,10 @@ CANADIENS_SEEN = "canadiens_seen"
 class DetectorState:
     state: str = IDLE
     state_entered_at: float = field(default_factory=time.time)
-    last_goal_time: float = 0.0
+    # Wall-clock time of last goal (used in live mode)
+    last_goal_wall_time: float = 0.0
+    # Video time of last goal in seconds (used in file mode)
+    last_goal_video_time: float = 0.0
     goals_detected: int = 0
     ocr_calls: int = 0
     logo_calls: int = 0
@@ -66,19 +73,15 @@ class DetectorState:
 @dataclass
 class FrameResult:
     """Everything process_frame() observed and decided for one frame."""
-    # What the detector saw
     red_ratio: float = 0.0
     is_red: bool = False
     ocr_text: str = ""
     logo_score: float = 0.0
-    # What stage matched
     canadiens_matched: bool = False
     goal_matched: bool = False
     logo_matched: bool = False
-    # State machine
     prev_state: str = IDLE
     new_state: str = IDLE
-    # Outcome
     goal_fired: bool = False
     cooldown_blocked: bool = False
     window_expired: bool = False
@@ -140,9 +143,9 @@ def red_ratio(roi_frame: np.ndarray) -> float:
 
 
 def preprocess_for_ocr(roi_frame: np.ndarray) -> np.ndarray:
-    scaled   = cv2.resize(roi_frame, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    gray     = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
-    inverted = cv2.bitwise_not(gray)
+    scaled    = cv2.resize(roi_frame, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    gray      = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+    inverted  = cv2.bitwise_not(gray)
     _, binary = cv2.threshold(inverted, 100, 255, cv2.THRESH_BINARY)
     return binary
 
@@ -160,8 +163,29 @@ def ocr_matches(text: str, substrings: tuple) -> bool:
     return any(s in text for s in substrings)
 
 
+def in_cooldown(
+    state: "DetectorState",
+    config: Config,
+    video_time: float,
+) -> bool:
+    """
+    Check cooldown using video time (file mode) or wall-clock (live mode).
+    video_time is the current frame position in seconds.
+    """
+    if config.live:
+        return (time.time() - state.last_goal_wall_time) < config.goal_cooldown_seconds
+    else:
+        return (video_time - state.last_goal_video_time) < config.goal_cooldown_seconds
+
+
+def update_cooldown(state: "DetectorState", video_time: float) -> None:
+    """Record the time of a confirmed goal."""
+    state.last_goal_wall_time  = time.time()
+    state.last_goal_video_time = video_time
+
+
 # ---------------------------------------------------------------------------
-# process_frame — the single source of truth for detection logic
+# process_frame — single source of truth for detection logic
 # ---------------------------------------------------------------------------
 
 def process_frame(
@@ -169,16 +193,20 @@ def process_frame(
     state: DetectorState,
     config: Config,
     template: np.ndarray | None,
+    video_time: float = 0.0,
 ) -> FrameResult:
     """
     Run one frame through the full detection pipeline.
-    Mutates `state` in place and returns a FrameResult describing everything
+    Mutates `state` in place. Returns a FrameResult describing everything
     that happened — used by both run() and the debugger.
+
+    video_time: current frame position in seconds (frame_num / source_fps).
+                Used for cooldown in file mode; ignored in live mode.
     """
-    result = FrameResult(prev_state=state.state, new_state=state.state)
-    now    = time.time()
-    elapsed = now - state.state_entered_at
-    has_template = template is not None
+    result   = FrameResult(prev_state=state.state, new_state=state.state)
+    now      = time.time()
+    elapsed  = now - state.state_entered_at
+    has_tmpl = template is not None
 
     # ── measure red ──────────────────────────────────────────────────────────
     result.red_ratio = red_ratio(roi_frame)
@@ -186,7 +214,7 @@ def process_frame(
 
     # ── IDLE ─────────────────────────────────────────────────────────────────
     if state.state == IDLE:
-        if has_template:
+        if has_tmpl:
             state.logo_calls += 1
             matched, score = logo_detected(
                 roi_frame, template,
@@ -200,7 +228,6 @@ def process_frame(
                 state.state = LOGO_SEEN
                 state.state_entered_at = now
         else:
-            # No template — jump straight to LOGO_SEEN on red
             if result.is_red:
                 state.state = LOGO_SEEN
                 state.state_entered_at = now
@@ -252,21 +279,21 @@ def process_frame(
         if result.goal_matched:
             state.state = IDLE
             state.state_entered_at = now
-            if (now - state.last_goal_time) < config.goal_cooldown_seconds:
+            if in_cooldown(state, config, video_time):
                 result.cooldown_blocked = True
             else:
                 result.goal_fired = True
                 state.goals_detected += 1
-                state.last_goal_time = now
+                update_cooldown(state, video_time)
 
         result.new_state = state.state
         return result
 
-    return result  # unreachable but satisfies linters
+    return result
 
 
 # ---------------------------------------------------------------------------
-# run() — video loop, uses process_frame()
+# run() — video loop
 # ---------------------------------------------------------------------------
 
 def run(config: Config, goal_callback=None):
@@ -285,7 +312,8 @@ def run(config: Config, goal_callback=None):
 
     source_fps     = math.ceil(cap.get(cv2.CAP_PROP_FPS) or 30)
     frame_interval = max(1, int(source_fps / config.sample_fps))
-    log.info(f"Source FPS: {source_fps} — sampling every {frame_interval} frames (~{config.sample_fps}fps)")
+    mode_str       = "LIVE (wall-clock cooldown)" if config.live else "FILE (video-time cooldown)"
+    log.info(f"Source FPS: {source_fps} — sampling every {frame_interval} frames (~{config.sample_fps}fps) — mode: {mode_str}")
     if not has_template:
         log.info("No logo template — running CANADIENS → GOAL sequence only.")
 
@@ -304,35 +332,30 @@ def run(config: Config, goal_callback=None):
             if frame_num % frame_interval != 0:
                 continue
 
-            roi_frame = frame[y:y + h, x:x + w]
-            result    = process_frame(roi_frame, state, config, template)
+            roi_frame  = frame[y:y + h, x:x + w]
+            video_time = frame_num / source_fps
+            result     = process_frame(roi_frame, state, config, template, video_time)
 
             if result.goal_fired:
-                sequence = "logo → CANADIENS → GOAL" if has_template else "CANADIENS → GOAL"
-                log.info(f"*** GOAL #{state.goals_detected} CONFIRMED ({sequence}) ***")
-
-                try:
-                    timestamp_seconds = frame_num / source_fps
-                except Exception:
-                    timestamp_seconds = 0.0
-                timestamp_str = time.strftime("%H:%M:%S", time.gmtime(timestamp_seconds))
+                sequence      = "logo → CANADIENS → GOAL" if has_template else "CANADIENS → GOAL"
+                timestamp_str = time.strftime("%H:%M:%S", time.gmtime(video_time))
+                log.info(f"*** GOAL #{state.goals_detected} CONFIRMED ({sequence}) — video time {timestamp_str} ***")
 
                 try:
                     save_dir  = "dev/detected"
                     os.makedirs(save_dir, exist_ok=True)
                     safe_ts   = timestamp_str.replace(":", "-")
                     filename  = f"goal_{state.goals_detected:03d}_frame{frame_num}_{safe_ts}.jpg"
-                    save_path = os.path.join(save_dir, filename)
-                    cv2.imwrite(save_path, frame)
-                    log.info(f"Saved detected frame → {save_path}")
+                    cv2.imwrite(os.path.join(save_dir, filename), frame)
+                    log.info(f"Saved frame → {os.path.join(save_dir, filename)}")
                 except Exception as e:
                     log.warning(f"Could not save frame: {e}")
 
                 try:
-                    goal_callback(timestamp_seconds, timestamp_str)
+                    goal_callback(video_time, timestamp_str)
                 except TypeError:
                     try:
-                        goal_callback(timestamp_seconds)
+                        goal_callback(video_time)
                     except TypeError:
                         goal_callback()
 
@@ -356,11 +379,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Detect MTL goals in hockey broadcasts.")
     parser.add_argument("-s", "--source", type=str, default="samples/mtl_ott_110326_30fps.mp4")
     parser.add_argument("-f", "--fps",    type=int, default=15)
+    parser.add_argument("--live", action="store_true",
+                        help="Live mode: use wall-clock cooldown (for HDMI capture). "
+                             "Default is file mode: video-time cooldown.")
     args = parser.parse_args()
 
     config = Config(
         video_source=args.source,
         roi=(68, 22, 146, 29),
         sample_fps=args.fps,
+        live=args.live,
     )
     run(config)
